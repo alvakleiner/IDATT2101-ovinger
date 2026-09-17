@@ -168,3 +168,52 @@ static void dualPivotQuicksort(int *t, int v, int h) {
         dualPivotQuicksort(t, hp + 1, h);
     }
 }
+
+
+// TIDSMÅLINGER
+
+// Kjører én sortering på ett datasett og kontrollerer resultatet. Tabellen fylles på nytt for hver 
+// måling: etter en sortering er den jo sortert, og en ny måling på samme data ville målt noe helt annet.
+static void maal(const char *navn, const char *datasett, void (*sorter)(int *, int, int),
+                 void (*fyll)(int *, int), int *t, int n) {
+
+    fyll(t, n);
+    long long foer = sjekksum(t, n);
+
+    double start = tidNaa();
+    sorter(t, 0, n - 1);
+    double tid = tidNaa() - start;
+
+    long long etter = sjekksum(t, n);
+    int sortert = erSortert(t, n);
+
+    printf("%-14s %-12s %8.3f s   sjekksum: %-4s  rekkefølge: %s\n",
+           navn, datasett, tid,
+           (foer == etter) ? "OK" : "FEIL",
+           sortert ? "OK" : "FEIL");
+}
+
+int main(void) {
+    int n = 50000000;
+
+    int *t = malloc((size_t)n * sizeof(int));
+    if (t == NULL) {
+        printf("Fikk ikke allokert minne til %d tall\n", n);
+        return 1;
+    }
+
+    printf("Antall tall: %d\n\n", n);
+
+    maal("single-pivot", "tilfeldig",  quicksort, fyllTilfeldig, t, n);
+    maal("single-pivot", "duplikater", quicksort, fyllDuplikater, t, n);
+    maal("single-pivot", "sortert",    quicksort, fyllSortert,   t, n);
+    maal("single-pivot", "baklengs",   quicksort, fyllBaklengs,  t, n);
+    printf("\n");
+    maal("dual-pivot",   "tilfeldig",  dualPivotQuicksort, fyllTilfeldig, t, n);
+    maal("dual-pivot",   "duplikater", dualPivotQuicksort, fyllDuplikater, t, n);
+    maal("dual-pivot",   "sortert",    dualPivotQuicksort, fyllSortert,   t, n);
+    maal("dual-pivot",   "baklengs",   dualPivotQuicksort, fyllBaklengs,  t, n);
+
+    free(t);
+    return 0;
+}
