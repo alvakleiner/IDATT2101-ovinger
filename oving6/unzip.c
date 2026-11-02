@@ -1,11 +1,14 @@
-/* BWT + MTF + Huffman decompression. Usage: unzip <infile> <outfile> */
+/* BWT + MTF + RLE + Huffman decompression. Usage: unzip <infile> <outfile> */
 
 #include <stdio.h>
 #include <stdlib.h>
 
-#define MAX_NODES 511
-#define TABLE_BYTES 1024
-#define HEADER_BYTES 4
+#define ALPHABET 257
+#define MAX_NODES (2 * ALPHABET - 1)
+#define TABLE_BYTES (ALPHABET * 4)
+#define HEADER_BYTES 8
+#define RUNA 0
+#define RUNB 1
 
 typedef struct {
     long weight;
@@ -67,10 +70,10 @@ static int writeFile(const char *name, const unsigned char *data, long length) {
 /* Huffman tree: repeatedly merge the two lightest nodes. Must stay identical to the copy in zip.c. */
 static int buildTree(const long *frequency, Node *node) {
     int count = 0;
-    int active[256];
+    int active[ALPHABET];
     int activeCount = 0;
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < ALPHABET; i++) {
         if (frequency[i] > 0) {
             node[count].weight = frequency[i];
             node[count].left = -1;
@@ -110,6 +113,26 @@ static int readBit(BitReader *r) {
         r->position++;
     }
     return bit;
+}
+
+/* Expands zero runs written in bijective base 2 back into zeros. */
+static long rleInverse(const int *in, long n, unsigned char *out) {
+    long count = 0;
+    for (long i = 0; i < n; i++) {
+        if (in[i] == RUNA || in[i] == RUNB) {
+            long length = 0, mult = 1;
+            while (i < n && (in[i] == RUNA || in[i] == RUNB)) {
+                length += (in[i] == RUNA ? 1 : 2) * mult;
+                mult *= 2;
+                i++;
+            }
+            i--;
+            while (length-- > 0) out[count++] = 0;
+        } else {
+            out[count++] = (unsigned char)(in[i] - 1);
+        }
+    }
+    return count;
 }
 
 /* Inverse move-to-front. */
@@ -162,11 +185,13 @@ int main(int argc, char *argv[]) {
 
     long origPtr = (long)data[0] | ((long)data[1] << 8)
                  | ((long)data[2] << 16) | ((long)data[3] << 24);
+    long blockLength = (long)data[4] | ((long)data[5] << 8)
+                     | ((long)data[6] << 16) | ((long)data[7] << 24);
 
-    long frequency[256] = {0};
+    long frequency[ALPHABET] = {0};
     long sum = 0;
     long pos = HEADER_BYTES;
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < ALPHABET; i++) {
         unsigned int fr = (unsigned int)data[pos]
                         | ((unsigned int)data[pos + 1] << 8)
                         | ((unsigned int)data[pos + 2] << 16)
@@ -184,7 +209,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (origPtr < 0 || origPtr >= sum) {
+    if (origPtr < 0 || origPtr >= blockLength) {
         printf("Corrupt header: rotation index out of range\n");
         free(data);
         return 1;
@@ -193,11 +218,13 @@ int main(int argc, char *argv[]) {
     Node node[MAX_NODES];
     int root = buildTree(frequency, node);
 
-    unsigned char *mtf = malloc(sum);
-    unsigned char *stage = malloc(sum);
-    unsigned char *out = malloc(sum);
-    if (mtf == NULL || stage == NULL || out == NULL) {
+    int *rle = malloc(sum * sizeof(int));
+    unsigned char *mtf = malloc(blockLength);
+    unsigned char *stage = malloc(blockLength);
+    unsigned char *out = malloc(blockLength);
+    if (rle == NULL || mtf == NULL || stage == NULL || out == NULL) {
         printf("Out of memory\n");
+        free(rle);
         free(mtf);
         free(stage);
         free(out);
@@ -211,16 +238,14 @@ int main(int argc, char *argv[]) {
         int n = root;
         while (node[n].left != -1)
             n = readBit(&r) ? node[n].right : node[n].left;
-        mtf[i] = (unsigned char)node[n].symbol;
+        rle[i] = node[n].symbol;
     }
 
-    /* MTF */
-    mtfInverse(mtf, sum, stage);
-
-    /* BWT */
-    bwtInverse(stage, sum, origPtr, out);
-
-    if (!writeFile(argv[2], out, sum)) {
+    /* RLE */
+    long mtfCount = rleInverse(rle, sum, mtf);
+    if (mtfCount != blockLength) {
+        printf("Length mismatch: expanded %ld, expected %ld\n", mtfCount, blockLength);
+        free(rle);
         free(mtf);
         free(stage);
         free(out);
@@ -228,8 +253,24 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("%s: %ld bytes  ->  %s: %ld bytes\n", argv[1], length, argv[2], sum);
+    /* MTF */
+    mtfInverse(mtf, blockLength, stage);
 
+    /* BWT */
+    bwtInverse(stage, blockLength, origPtr, out);
+
+    if (!writeFile(argv[2], out, blockLength)) {
+        free(rle);
+        free(mtf);
+        free(stage);
+        free(out);
+        free(data);
+        return 1;
+    }
+
+    printf("%s: %ld bytes  ->  %s: %ld bytes\n", argv[1], length, argv[2], blockLength);
+
+    free(rle);
     free(mtf);
     free(stage);
     free(out);
