@@ -12,6 +12,11 @@ typedef struct {
     int symbol;
 } Node;
 
+typedef struct {
+    unsigned long long bits;
+    int length;
+} Code;
+
 static unsigned char *readFile(const char *name, long *length) {
     FILE *f = fopen(name, "rb");
     if (f == NULL) {
@@ -96,6 +101,19 @@ static int buildTree(const long *frequency, Node *node) {
     return active[0];
 }
 
+/* Walk the tree and record the bit code for each byte value.
+   Left branch appends 0, right branch appends 1. */
+static void buildCodes(const Node *node, int i,
+                       unsigned long long bits, int depth, Code *code) {
+    if (node[i].left == -1) {
+        code[node[i].symbol].bits = bits;
+        code[node[i].symbol].length = depth;
+        return;
+    }
+    buildCodes(node, node[i].left,  bits << 1,       depth + 1, code);
+    buildCodes(node, node[i].right, (bits << 1) | 1, depth + 1, code);
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         printf("Usage: %s <infile> <outfile>\n", argv[0]);
@@ -127,6 +145,22 @@ int main(int argc, char *argv[]) {
     printf("Root weight: %ld (length: %ld)  %s\n",
            node[root].weight, length,
            (node[root].weight == length) ? "OK" : "FAIL");
+
+    /* Step 3: derive the code table */
+    Code code[256] = {0};
+    buildCodes(node, root, 0, 0, code);
+
+    long bits = 0;
+    int maxLength = 0;
+    for (int i = 0; i < 256; i++) {
+        bits += frequency[i] * code[i].length;
+        if (code[i].length > maxLength) maxLength = code[i].length;
+    }
+    printf("Longest code: %d bits\n", maxLength);
+    printf("Payload: %ld bits = %ld bytes\n", bits, (bits + 7) / 8);
+    printf("Estimated output: %ld bytes (%.1f%% of original)\n",
+           (bits + 7) / 8 + 1024,
+           100.0 * ((bits + 7) / 8 + 1024) / length);
 
     if (!writeFile(argv[2], data, length)) {
         free(data);
