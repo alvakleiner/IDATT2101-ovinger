@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# oving6
+zip
+unzip
+*.komp
+*.ut
+diverse.lyx
+diverse.txt
