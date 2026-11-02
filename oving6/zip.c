@@ -1,35 +1,28 @@
-/* Øving 6 - komprimering
-   Foreløpig gjør den ingen komprimering, bare kopierer fila.
-   Hensikten er å få fil-inn og fil-ut til å fungere feilfritt først. */
+/* Huffman compression. Usage: zip <infile> <outfile> */
 
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Leser hele fila inn i en nyallokert buffer.
-   Returnerer bufferet, og legger antall byte i *lengde.
-   Returnerer NULL ved feil.                                          */
-static unsigned char *lesFil(const char *navn, long *lengde) {
-    FILE *f = fopen(navn, "rb");        /* "b" = binaermodus */
+static unsigned char *readFile(const char *name, long *length) {
+    FILE *f = fopen(name, "rb");
     if (f == NULL) {
-        printf("Fikk ikke aapnet %s\n", navn);
+        printf("Could not open %s\n", name);
         return NULL;
     }
 
-    /* Finn filstoerrelsen ved aa hoppe til slutten og lese av posisjonen */
     fseek(f, 0, SEEK_END);
-    *lengde = ftell(f);
+    *length = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    unsigned char *data = malloc(*lengde);
+    unsigned char *data = malloc(*length);
     if (data == NULL) {
-        printf("Fikk ikke allokert %ld byte\n", *lengde);
+        printf("Could not allocate %ld bytes\n", *length);
         fclose(f);
         return NULL;
     }
 
-    /* fread returnerer antall byte som faktisk ble lest */
-    if (fread(data, 1, *lengde, f) != (size_t)*lengde) {
-        printf("Fikk ikke lest hele fila\n");
+    if (fread(data, 1, *length, f) != (size_t)*length) {
+        printf("Could not read entire file\n");
         free(data);
         fclose(f);
         return NULL;
@@ -39,15 +32,14 @@ static unsigned char *lesFil(const char *navn, long *lengde) {
     return data;
 }
 
-/* Skriver lengde byte fra data til fil. Returnerer 1 ved suksess. */
-static int skrivFil(const char *navn, const unsigned char *data, long lengde) {
-    FILE *f = fopen(navn, "wb");
+static int writeFile(const char *name, const unsigned char *data, long length) {
+    FILE *f = fopen(name, "wb");
     if (f == NULL) {
-        printf("Fikk ikke aapnet %s for skriving\n", navn);
+        printf("Could not open %s for writing\n", name);
         return 0;
     }
-    if (fwrite(data, 1, lengde, f) != (size_t)lengde) {
-        printf("Fikk ikke skrevet hele fila\n");
+    if (fwrite(data, 1, length, f) != (size_t)length) {
+        printf("Could not write entire file\n");
         fclose(f);
         return 0;
     }
@@ -57,23 +49,35 @@ static int skrivFil(const char *navn, const unsigned char *data, long lengde) {
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        printf("Bruk: %s <innfil> <utfil>\n", argv[0]);
+        printf("Usage: %s <infile> <outfile>\n", argv[0]);
         return 1;
     }
 
-    long lengde;
-    unsigned char *data = lesFil(argv[1], &lengde);
+    long length;
+    unsigned char *data = readFile(argv[1], &length);
     if (data == NULL) return 1;
 
-    /* ---- Her kommer komprimeringen senere ---- */
+    /* Step 1: byte frequencies */
+    long frequency[256] = {0};
+    for (long i = 0; i < length; i++) frequency[data[i]]++;
 
-    if (!skrivFil(argv[2], data, lengde)) {
+    long sum = 0;
+    int distinct = 0;
+    for (int i = 0; i < 256; i++) {
+        sum += frequency[i];
+        if (frequency[i] > 0) distinct++;
+    }
+    printf("Frequency sum: %ld (length: %ld)  %s\n",
+           sum, length, (sum == length) ? "OK" : "FAIL");
+    printf("Distinct byte values: %d of 256\n", distinct);
+
+    if (!writeFile(argv[2], data, length)) {
         free(data);
         return 1;
     }
 
-    printf("%s: %ld byte  ->  %s: %ld byte\n",
-           argv[1], lengde, argv[2], lengde);
+    printf("%s: %ld bytes  ->  %s: %ld bytes\n",
+           argv[1], length, argv[2], length);
 
     free(data);
     return 0;
