@@ -1,10 +1,11 @@
-/* Huffman decompression. Usage: unzip <infile> <outfile> */
+/* BWT + MTF + Huffman decompression. Usage: unzip <infile> <outfile> */
 
 #include <stdio.h>
 #include <stdlib.h>
 
 #define MAX_NODES 511
 #define TABLE_BYTES 1024
+#define HEADER_BYTES 4
 
 typedef struct {
     long weight;
@@ -63,8 +64,7 @@ static int writeFile(const char *name, const unsigned char *data, long length) {
     return 1;
 }
 
-/* Huffman tree construction: repeatedly merge the two lightest nodes. Returns the index of the root.
-   Must stay byte-for-byte identical to the copy in zip.c, or this rebuilds a different tree. */
+/* Huffman tree: repeatedly merge the two lightest nodes. Must stay identical to the copy in zip.c. */
 static int buildTree(const long *frequency, Node *node) {
     int count = 0;
     int active[256];
@@ -112,6 +112,38 @@ static int readBit(BitReader *r) {
     return bit;
 }
 
+/* Inverse move-to-front. */
+static void mtfInverse(const unsigned char *in, long n, unsigned char *out) {
+    unsigned char list[256];
+    for (int i = 0; i < 256; i++) list[i] = (unsigned char)i;
+
+    for (long i = 0; i < n; i++) {
+        int j = in[i];
+        unsigned char c = list[j];
+        out[i] = c;
+        for (int k = j; k > 0; k--) list[k] = list[k - 1];
+        list[0] = c;
+    }
+}
+
+/* Inverse Burrows-Wheeler transform. */
+static void bwtInverse(const unsigned char *in, long n, long origPtr, unsigned char *out) {
+    long count[257] = {0};
+    for (long i = 0; i < n; i++) count[in[i] + 1]++;
+    for (int i = 1; i < 257; i++) count[i] += count[i - 1];
+
+    long *next = malloc(n * sizeof(long));
+    if (next == NULL) return;
+    for (long i = 0; i < n; i++) next[count[in[i]]++] = i;
+
+    long p = next[origPtr];
+    for (long i = 0; i < n; i++) {
+        out[i] = in[p];
+        p = next[p];
+    }
+    free(next);
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         printf("Usage: %s <infile> <outfile>\n", argv[0]);
@@ -122,17 +154,18 @@ int main(int argc, char *argv[]) {
     unsigned char *data = readFile(argv[1], &length);
     if (data == NULL) return 1;
 
-    if (length < TABLE_BYTES) {
-        printf("File is too short to contain a frequency table\n");
+    if (length < HEADER_BYTES + TABLE_BYTES) {
+        printf("File is too short to contain a header\n");
         free(data);
         return 1;
     }
 
-    /* Read the frequency table. The sum of the frequencies is the length of the original file,
-       so no separate length field is needed. */
+    long origPtr = (long)data[0] | ((long)data[1] << 8)
+                 | ((long)data[2] << 16) | ((long)data[3] << 24);
+
     long frequency[256] = {0};
     long sum = 0;
-    long pos = 0;
+    long pos = HEADER_BYTES;
     for (int i = 0; i < 256; i++) {
         unsigned int fr = (unsigned int)data[pos]
                         | ((unsigned int)data[pos + 1] << 8)
@@ -151,27 +184,45 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    Node node[MAX_NODES];
-    int root = buildTree(frequency, node);
-
-    unsigned char *out = malloc(sum);
-    if (out == NULL) {
-        printf("Could not allocate %ld bytes\n", sum);
+    if (origPtr < 0 || origPtr >= sum) {
+        printf("Corrupt header: rotation index out of range\n");
         free(data);
         return 1;
     }
 
-    /* Follow the bit stream from the root. Every leaf emits one byte and restarts at the root.
-       A file of one repeated byte has a leaf as its root, so no bits are consumed at all. */
-    BitReader r = { data + TABLE_BYTES, 0, 0 };
+    Node node[MAX_NODES];
+    int root = buildTree(frequency, node);
+
+    unsigned char *mtf = malloc(sum);
+    unsigned char *stage = malloc(sum);
+    unsigned char *out = malloc(sum);
+    if (mtf == NULL || stage == NULL || out == NULL) {
+        printf("Out of memory\n");
+        free(mtf);
+        free(stage);
+        free(out);
+        free(data);
+        return 1;
+    }
+
+    /* Huffman */
+    BitReader r = { data + HEADER_BYTES + TABLE_BYTES, 0, 0 };
     for (long i = 0; i < sum; i++) {
         int n = root;
         while (node[n].left != -1)
             n = readBit(&r) ? node[n].right : node[n].left;
-        out[i] = (unsigned char)node[n].symbol;
+        mtf[i] = (unsigned char)node[n].symbol;
     }
 
+    /* MTF */
+    mtfInverse(mtf, sum, stage);
+
+    /* BWT */
+    bwtInverse(stage, sum, origPtr, out);
+
     if (!writeFile(argv[2], out, sum)) {
+        free(mtf);
+        free(stage);
         free(out);
         free(data);
         return 1;
@@ -179,6 +230,8 @@ int main(int argc, char *argv[]) {
 
     printf("%s: %ld bytes  ->  %s: %ld bytes\n", argv[1], length, argv[2], sum);
 
+    free(mtf);
+    free(stage);
     free(out);
     free(data);
     return 0;

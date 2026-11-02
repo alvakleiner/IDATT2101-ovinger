@@ -1,10 +1,12 @@
-/* Huffman compression. Usage: zip <infile> <outfile> */
+/* BWT + MTF + Huffman compression. Usage: zip <infile> <outfile> */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define MAX_NODES 511
 #define TABLE_BYTES 1024
+#define HEADER_BYTES 4
 
 typedef struct {
     long weight;
@@ -69,8 +71,73 @@ static int writeFile(const char *name, const unsigned char *data, long length) {
     return 1;
 }
 
-/* Huffman tree construction: repeatedly merge the two lightest nodes. Returns the index of the root.
-   Must stay byte-for-byte identical to the copy in unzip.c, or the decoder rebuilds a different tree. */
+static int *gRank;
+static long gK, gN;
+
+static int compareRotations(const void *pa, const void *pb) {
+    long a = *(const long *)pa, b = *(const long *)pb;
+    if (gRank[a] != gRank[b]) return gRank[a] < gRank[b] ? -1 : 1;
+    int ra = gRank[(a + gK) % gN], rb = gRank[(b + gK) % gN];
+    return ra < rb ? -1 : (ra > rb ? 1 : 0);
+}
+
+/* Burrows-Wheeler transform, rotations sorted by prefix doubling.
+   Returns the index of the unrotated block in the sorted order. */
+static long bwtForward(const unsigned char *in, long n, unsigned char *out) {
+    long *sa = malloc(n * sizeof(long));
+    int *rank = malloc(n * sizeof(int));
+    int *tmp = malloc(n * sizeof(int));
+    if (sa == NULL || rank == NULL || tmp == NULL) {
+        free(sa);
+        free(rank);
+        free(tmp);
+        return -1;
+    }
+
+    for (long i = 0; i < n; i++) {
+        sa[i] = i;
+        rank[i] = in[i];
+    }
+    gRank = rank;
+    gN = n;
+
+    for (long k = 1; k < n; k *= 2) {
+        gK = k;
+        qsort(sa, n, sizeof(long), compareRotations);
+        tmp[sa[0]] = 0;
+        for (long i = 1; i < n; i++)
+            tmp[sa[i]] = tmp[sa[i - 1]] + (compareRotations(&sa[i - 1], &sa[i]) != 0 ? 1 : 0);
+        memcpy(rank, tmp, n * sizeof(int));
+        if (rank[sa[n - 1]] == n - 1) break;
+    }
+
+    long origPtr = 0;
+    for (long i = 0; i < n; i++) {
+        if (sa[i] == 0) origPtr = i;
+        out[i] = in[(sa[i] + n - 1) % n];
+    }
+
+    free(sa);
+    free(rank);
+    free(tmp);
+    return origPtr;
+}
+
+/* Move-to-front transform. */
+static void mtfForward(const unsigned char *in, long n, unsigned char *out) {
+    unsigned char list[256];
+    for (int i = 0; i < 256; i++) list[i] = (unsigned char)i;
+
+    for (long i = 0; i < n; i++) {
+        int j = 0;
+        while (list[j] != in[i]) j++;
+        out[i] = (unsigned char)j;
+        for (int k = j; k > 0; k--) list[k] = list[k - 1];
+        list[0] = in[i];
+    }
+}
+
+/* Huffman tree: repeatedly merge the two lightest nodes. Must stay identical to the copy in unzip.c. */
 static int buildTree(const long *frequency, Node *node) {
     int count = 0;
     int active[256];
@@ -109,7 +176,7 @@ static int buildTree(const long *frequency, Node *node) {
     return active[0];
 }
 
-/* Walk the tree and record the bit code for each byte value. Left branch appends 0, right appends 1. */
+/* Left branch appends 0, right appends 1. */
 static void buildCodes(const Node *node, int i, unsigned long long bits, int depth, Code *code) {
     if (node[i].left == -1) {
         code[node[i].symbol].bits = bits;
@@ -131,8 +198,6 @@ static void writeBits(BitWriter *w, unsigned long long bits, int length) {
     }
 }
 
-/* Pad the final partial byte with zeros. The decoder stops after the expected number of symbols, 
-   so the padding is never decoded. */
 static void flushBits(BitWriter *w) {
     if (w->bitCount > 0) {
         w->current = (unsigned char)(w->current << (8 - w->bitCount));
@@ -152,48 +217,69 @@ int main(int argc, char *argv[]) {
     unsigned char *data = readFile(argv[1], &length);
     if (data == NULL) return 1;
 
-    /* Step 1: byte frequencies */
-    long frequency[256] = {0};
-    for (long i = 0; i < length; i++) frequency[data[i]]++;
-
-    /* An empty file has no tree and no codes, so write the all-zero table and stop. */
     if (length == 0) {
-        unsigned char empty[TABLE_BYTES] = {0};
-        int ok = writeFile(argv[2], empty, TABLE_BYTES);
+        unsigned char empty[HEADER_BYTES + TABLE_BYTES] = {0};
+        int ok = writeFile(argv[2], empty, HEADER_BYTES + TABLE_BYTES);
         free(data);
         if (!ok) return 1;
-        printf("%s: 0 bytes  ->  %s: %d bytes\n", argv[1], argv[2], TABLE_BYTES);
+        printf("%s: 0 bytes  ->  %s: %d bytes\n", argv[1], argv[2], HEADER_BYTES + TABLE_BYTES);
         return 0;
     }
 
-    long sum = 0;
-    for (int i = 0; i < 256; i++) sum += frequency[i];
-    printf("Frequency sum: %ld (length: %ld)  %s\n", sum, length, (sum == length) ? "OK" : "FAIL");
+    unsigned char *stage = malloc(length);
+    unsigned char *mtf = malloc(length);
+    if (stage == NULL || mtf == NULL) {
+        printf("Out of memory\n");
+        free(stage);
+        free(mtf);
+        free(data);
+        return 1;
+    }
 
-    /* Step 2: build the Huffman tree */
+    /* BWT */
+    long origPtr = bwtForward(data, length, stage);
+    if (origPtr < 0) {
+        printf("BWT failed, out of memory\n");
+        free(stage);
+        free(mtf);
+        free(data);
+        return 1;
+    }
+
+    /* MTF */
+    mtfForward(stage, length, mtf);
+
+    /* Huffman */
+    long frequency[256] = {0};
+    for (long i = 0; i < length; i++) frequency[mtf[i]]++;
+
     Node node[MAX_NODES];
     int root = buildTree(frequency, node);
     printf("Root weight: %ld (length: %ld)  %s\n",
            node[root].weight, length, (node[root].weight == length) ? "OK" : "FAIL");
 
-    /* Step 3: derive the code table */
     Code code[256] = {0};
     buildCodes(node, root, 0, 0, code);
 
     long bits = 0;
     for (int i = 0; i < 256; i++) bits += frequency[i] * code[i].length;
-    long outLength = TABLE_BYTES + (bits + 7) / 8;
+    long outLength = HEADER_BYTES + TABLE_BYTES + (bits + 7) / 8;
 
-    unsigned char *out = malloc(outLength);
+    unsigned char *out = malloc(outLength + 1);
     if (out == NULL) {
         printf("Could not allocate output buffer\n");
+        free(stage);
+        free(mtf);
         free(data);
         return 1;
     }
 
-    /* Step 4a: write the frequency table, four bytes per entry, least significant byte first. 
-       The decoder rebuilds the same tree from this, and the sum of the frequencies gives the length. */
+    /* Header: rotation index, then 256 frequencies, four bytes each, least significant first. */
     long pos = 0;
+    out[pos++] = (unsigned char)(origPtr & 0xFF);
+    out[pos++] = (unsigned char)((origPtr >> 8) & 0xFF);
+    out[pos++] = (unsigned char)((origPtr >> 16) & 0xFF);
+    out[pos++] = (unsigned char)((origPtr >> 24) & 0xFF);
     for (int i = 0; i < 256; i++) {
         unsigned int fr = (unsigned int)frequency[i];
         out[pos++] = (unsigned char)(fr & 0xFF);
@@ -202,21 +288,25 @@ int main(int argc, char *argv[]) {
         out[pos++] = (unsigned char)((fr >> 24) & 0xFF);
     }
 
-    /* Step 4b: write the codes as packed bits */
-    BitWriter w = { out + TABLE_BYTES, 0, 0, 0 };
+    BitWriter w = { out + HEADER_BYTES + TABLE_BYTES, 0, 0, 0 };
     for (long i = 0; i < length; i++)
-        writeBits(&w, code[data[i]].bits, code[data[i]].length);
+        writeBits(&w, code[mtf[i]].bits, code[mtf[i]].length);
     flushBits(&w);
 
-    if (TABLE_BYTES + w.position != outLength) {
-        printf("Size mismatch: wrote %ld, expected %ld\n", TABLE_BYTES + w.position, outLength);
+    if (HEADER_BYTES + TABLE_BYTES + w.position != outLength) {
+        printf("Size mismatch: wrote %ld, expected %ld\n",
+               HEADER_BYTES + TABLE_BYTES + w.position, outLength);
         free(out);
+        free(stage);
+        free(mtf);
         free(data);
         return 1;
     }
 
     if (!writeFile(argv[2], out, outLength)) {
         free(out);
+        free(stage);
+        free(mtf);
         free(data);
         return 1;
     }
@@ -225,6 +315,8 @@ int main(int argc, char *argv[]) {
            argv[1], length, argv[2], outLength, 100.0 * outLength / length);
 
     free(out);
+    free(stage);
+    free(mtf);
     free(data);
     return 0;
 }
